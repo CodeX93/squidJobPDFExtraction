@@ -5,3 +5,6 @@ pdfplumber
 PyMuPDF
 python-multipart
 google-genai
+python-dotenv
+httpx
+openpyxl

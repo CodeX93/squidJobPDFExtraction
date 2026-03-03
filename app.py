@@ -7,7 +7,7 @@ pip install fastapi uvicorn pdfplumber python-multipart pymupdf openai
 """
 
 # import _typeshed.importlib
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 import pdfplumber
 import fitz  # PyMuPDF for links and metadata
@@ -16,20 +16,33 @@ import re
 import base64
 import os
 import json
+import tempfile
+import sys
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
-from google import genai
 
+# Ensure user site-packages are on the path (needed when uvicorn --reload
+# spawns a fresh subprocess that may not inherit the full PYTHONPATH).
+import site
+for _sp in site.getusersitepackages() if isinstance(site.getusersitepackages(), list) else [site.getusersitepackages()]:
+    if _sp not in sys.path:
+        sys.path.insert(0, _sp)
+
+import httpx
+import openpyxl
+from google import genai
+import dotenv
 app = FastAPI(
     title="PDF to JSON Extraction API",
     description="Extract complete PDF content including text, tables, and links",
     version="1.0.0"
 )
-
+dotenv.load_dotenv()
 # --- Configuration ---
 # Gemini API Key configuration
-GEMINI_API_KEY = "AIzaSyDs3xVeYQ6UsO1XlGwIg6ShnbY6fPlD3KY"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
 if not GEMINI_API_KEY:
     print("Warning: GEMINI_API_KEY not set in environment.")
 
@@ -418,6 +431,164 @@ class PDFExtractor:
 extractor = PDFExtractor()
 
 
+# ---------------------------------------------------------------------------
+# External file download + summarization helper
+# ---------------------------------------------------------------------------
+
+def _extract_excel_text(file_bytes: bytes) -> str:
+    """Extract readable text from an Excel (.xlsx) file."""
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+        lines = []
+        for sheet in wb.worksheets:
+            lines.append(f"[Sheet: {sheet.title}]")
+            for row in sheet.iter_rows(values_only=True):
+                non_empty = [str(c) for c in row if c is not None and str(c).strip()]
+                if non_empty:
+                    lines.append(" | ".join(non_empty))
+        return "\n".join(lines)
+    except Exception as e:
+        return f"[Could not parse Excel: {e}]"
+
+
+def _extract_text_from_bytes(file_bytes: bytes, content_type: str, url: str) -> str:
+    """Detect file type and return extracted plain text."""
+    lower_url = url.lower()
+    is_excel = (
+        "spreadsheet" in content_type
+        or lower_url.endswith(".xlsx")
+        or lower_url.endswith(".xls")
+    )
+    is_pdf = "pdf" in content_type or lower_url.endswith(".pdf")
+
+    if is_excel:
+        return _extract_excel_text(file_bytes)
+
+    if is_pdf:
+        # Run sync extractor in event loop — already done inside async context
+        import asyncio
+        loop = asyncio.get_event_loop()
+        # extract_from_pdf is async; call it synchronously via a new task
+        # We'll handle this in the async caller instead
+        return "__PDF__"  # sentinel handled in async caller
+
+    # Fallback: try to decode as UTF-8 text
+    try:
+        return file_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        return "[Binary file — content not readable as text]"
+
+
+async def _get_gemini_summary(client, text: str, filename_hint: str) -> str:
+    """Ask Gemini to summarize file content in 3-5 sentences."""
+    prompt = (
+        f"You are summarizing a document referenced in a government bid/tender.\n"
+        f"File hint: {filename_hint}\n\n"
+        f"Summarize the following content in 3-5 concise sentences. "
+        f"Focus on: purpose of the document, key items/quantities/prices (if any), "
+        f"important clauses or conditions. Do NOT output JSON, just plain text.\n\n"
+        f"--- FILE CONTENT (first 8000 chars) ---\n{text[:8000]}"
+    )
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+        return response.text.strip()
+    except Exception as e:
+        return f"[Gemini summarization failed: {e}]"
+
+
+async def summarize_external_files(
+    file_refs: Dict[str, Any],
+    gemini_client,
+    cookies: Optional[Dict[str, str]] = None,
+    extra_headers: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """
+    For each entry in external_file_references:
+      - If the value is a URL  → download (with optional auth cookies), extract text, summarize with Gemini
+      - Otherwise             → return {url: null, summary: "No downloadable link found."}
+    Returns a dict with the same keys but values replaced by {url, summary} objects.
+    """
+    enriched = {}
+
+    default_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/pdf,application/octet-stream,*/*",
+        "Referer": "https://bidplus.gem.gov.in/",
+    }
+    if extra_headers:
+        default_headers.update(extra_headers)
+
+    cookie_jar = httpx.Cookies(cookies or {})
+
+    async with httpx.AsyncClient(
+        timeout=30.0,
+        follow_redirects=True,
+        headers=default_headers,
+        cookies=cookie_jar,
+    ) as http:
+        for key, value in file_refs.items():
+            if not value or value in ("Not Found", "null", "N/A"):
+                enriched[key] = {
+                    "url": None,
+                    "summary": "No downloadable link found."
+                }
+                continue
+
+            # Check if value looks like a URL
+            if not (isinstance(value, str) and value.startswith("http")):
+                enriched[key] = {
+                    "url": None,
+                    "summary": f"Reference noted (not a direct URL): {value}"
+                }
+                continue
+
+            url = value
+            try:
+                resp = await http.get(url)
+                resp.raise_for_status()
+                file_bytes = resp.content
+                content_type = resp.headers.get("content-type", "").lower()
+
+                # Check for PDF sentinel
+                lower_url = url.lower()
+                is_pdf = "pdf" in content_type or lower_url.endswith(".pdf")
+
+                if is_pdf:
+                    pdf_result = await extractor.extract_from_pdf(file_bytes)
+                    pages_text = "\n".join(
+                        p.get("raw_text", "") for p in pdf_result.get("pages", [])
+                    )
+                    text_content = pages_text
+                else:
+                    text_content = _extract_text_from_bytes(file_bytes, content_type, url)
+
+                if not text_content.strip():
+                    text_content = "[File downloaded but appears to be empty or unreadable.]"
+
+                summary = await _get_gemini_summary(gemini_client, text_content, key)
+                enriched[key] = {"url": url, "summary": summary}
+
+            except httpx.HTTPStatusError as e:
+                enriched[key] = {
+                    "url": url,
+                    "summary": f"Failed to download (HTTP {e.response.status_code})."
+                }
+            except Exception as e:
+                enriched[key] = {
+                    "url": url,
+                    "summary": f"Error processing file: {str(e)}"
+                }
+
+    return enriched
+
+
 @app.post("/extract-pdf", response_class=JSONResponse)
 async def extract_pdf(file: UploadFile = File(...)):
     """
@@ -495,11 +666,21 @@ async def extract_pdfs_batch(files: List[UploadFile] = File(...)):
 
 @app.post("/extract-bid-gemini", response_class=JSONResponse)
 async def extract_bid_gemini(
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    cookie_string: Optional[str] = Form(
+        default=None,
+        description=(
+            "Optional: raw browser Cookie header string from an authenticated GeM session. "
+            "Paste the value of the 'Cookie' header from your browser DevTools while logged in to GeM. "
+            "Example: 'PHPSESSID=abc123; other_cookie=xyz'"
+        )
+    ),
 ):
     """
     Extract structured bid information using Google Gemini 2.5 Flash API.
-    
+
+    Optionally pass `cookie_string` (multipart form field) with your GeM browser
+    session cookies to allow downloading of restricted file attachments.
     Requires GEMINI_API_KEY environment variable.
     """
     
@@ -632,7 +813,25 @@ async def extract_bid_gemini(
         
         # Parse JSON response
         parsed_json = json.loads(response.text)
-        
+
+        # Parse cookie_string into a dict for authenticated downloads
+        cookies_dict: Optional[Dict[str, str]] = None
+        if cookie_string and cookie_string.strip():
+            cookies_dict = {}
+            for part in cookie_string.split(";"):
+                part = part.strip()
+                if "=" in part:
+                    k, _, v = part.partition("=")
+                    cookies_dict[k.strip()] = v.strip()
+
+        # Enrich external_file_references with download + Gemini summaries
+        if "external_file_references" in parsed_json and isinstance(
+            parsed_json["external_file_references"], dict
+        ):
+            parsed_json["external_file_references"] = await summarize_external_files(
+                parsed_json["external_file_references"], client, cookies=cookies_dict
+            )
+
         return JSONResponse(content=parsed_json)
 
     except Exception as e:
